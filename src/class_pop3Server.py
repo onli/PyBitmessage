@@ -2,10 +2,13 @@ from cStringIO import StringIO
 from collections import deque
 import asyncore
 import hashlib
+import re
 import shared
 import socket
 import ssl
+import string
 import sys
+
 
 from email import parser, generator, utils
 
@@ -27,7 +30,7 @@ class bitmessagePOP3Connection(asyncore.dispatcher):
             PASS=self.handlePass,
             STAT=self.handleStat,
             LIST=self.handleList,
-            #TOP=self.handleTop,
+            TOP=self.handleTop,
             RETR=self.handleRetr,
             DELE=self.handleDele,
             NOOP=self.handleNoop,
@@ -62,17 +65,21 @@ class bitmessagePOP3Connection(asyncore.dispatcher):
 
         self.storage_size = 0
         self.messages = []
+        i = 0
         for row in queryreturn:
+            i += 1
             msgid, fromAddress, subject, body = row
             subject = shared.fixPotentiallyInvalidUTF8Data(subject)
             body    = shared.fixPotentiallyInvalidUTF8Data(body)
+            
 
             message = parser.Parser().parsestr(body)
-            if not ('Date' in message and 'From' in message and 'X-Bitmessage-Flags' in message):
-                continue
+            #if not ('Date' in message and 'From' in message and 'X-Bitmessage-Flags' in message):
+            #    print("Debug: found cause to ignore message")
+            #    continue
 
             flags = message['X-Bitmessage-Flags'] # TODO - verify checksum?
-
+            
             self.messages.append({
                 'msgid'      : msgid,
                 'fromAddress': fromAddress,
@@ -80,7 +87,6 @@ class bitmessagePOP3Connection(asyncore.dispatcher):
                 'size'       : len(body),
                 'flags'      : flags,
             })
-
             self.storage_size += len(body)
 
     def getMessageContent(self, msgid):
@@ -103,6 +109,51 @@ class bitmessagePOP3Connection(asyncore.dispatcher):
                 'message'     : message,
                 'encodingtype': encodingtype
             }
+
+    # Add the needed headers
+    # message: email object
+    # content: message map as returned from getMessageContent
+    def makeValid(self, message, content):
+        if "Message-Id" not in message:
+            message["Message-Id"] = "<" + hashlib.sha224(content['message'] + content['received']).hexdigest() + ">"
+
+        if "Date" not in message:
+            message["Date"] = utils.formatdate(float(content['received']))
+
+        if "From" not in message:
+            message["From"] = '{}@bm.addr'.format(content['fromAddress'])
+        return message
+
+    # Dirty regexp-apporach of getting all headers from  a mail (as a string)
+    def getHeaders(self, message):
+        headerStart = re.compile("["+string.printable.replace(" ","")+"]*: .*") 
+        headerFolded = re.compile("\s.*")
+        emptyLine = re.compile("\s*")
+        boundaryDefinition = re.compile(".*boundary=(.*)")
+        boundaryStart = None
+        inHeaders = True
+        skip = False
+        headers = ""
+        for line in message.split("\n"):
+            if inHeaders:
+                if headerStart.match(line):
+                    headers += line + "\n"
+                elif headerFolded.match(line):
+                    headers += line + "\n"
+                    if boundaryDefinition.search(line):
+                        boundary = "--" + boundaryDefinition.search(line).group(1)
+                        boundaryStart = re.compile(boundary.replace('"', ""))
+                elif emptyLine.match(line):
+                    inHeaders = False
+                else:
+                    print "Error: Unknown headerline"
+                    print line
+            else:
+                if boundaryStart:
+                    if boundaryStart.match(line):
+                        inHeaders = True
+        return headers
+        
 
     def trashMessage(self, msgid):
         # TODO - how to determine if the update succeeded?
@@ -169,7 +220,7 @@ class bitmessagePOP3Connection(asyncore.dispatcher):
         if '@' in data:
             data, _ = data.split('@', 1)
 
-        self.address = data
+        self.address = data.strip()
         status, addressVersionNumber, streamNumber, ripe = decodeAddress(self.address)
         if status != 'success':
             with shared.printLock:
@@ -217,12 +268,33 @@ class bitmessagePOP3Connection(asyncore.dispatcher):
             yield "{} {}".format(i + 1, msg['size'])
         yield "."
 
-    #def handleTop(self, data):
-    #    cmd, num, lines = data.split()
-    #    assert num == "1", "unknown message number: {}".format(num)
-    #    lines = int(lines)
-    #    text = msg.top + "\r\n\r\n" + "\r\n".join(msg.bot[:lines])
-    #    return "+OK top of message follows\r\n{}\r\n.".format(text)
+    def handleTop(self, data):
+        index, additionalBytes = data.decode('ascii').split(" ")
+        index = int(index) - 1
+        assert index >= 0
+        self.populateMessageIndex()
+        msg = self.messages[index]
+        content = self.getMessageContent(msg['msgid'])
+       # headers = parser.HeaderParser().parsestr(content['message'], True)   # This fails, as python is unable to only select the headers even from valid mails. wtf
+       
+        message = parser.Parser().parsestr(content['message'])
+        message = self.makeValid(message, content)
+
+        fp = StringIO()
+        gen = generator.Generator(fp, mangle_from_=False, maxheaderlen=128)
+        gen.flatten(message)
+
+        content['message'] = fp.getvalue()
+
+        headers = self.getHeaders(content['message'])
+
+        if self.debug:
+            with shared.printLock:
+                sys.stdout.write(str(msg) + ": " + str(content))
+        yield "+OK {} octets".format(len(headers))
+        self.sendline(headers, END='')
+        yield (bitmessagePOP3Connection.END + '.')
+                
     
     def handleRetr(self, data):
         index = int(data.decode('ascii')) - 1
@@ -230,6 +302,16 @@ class bitmessagePOP3Connection(asyncore.dispatcher):
         self.populateMessageIndex()
         msg = self.messages[index]
         content = self.getMessageContent(msg['msgid'])
+        message = parser.Parser().parsestr(content['message'])
+        
+        message = self.makeValid(message, content)
+
+        fp = StringIO()
+        gen = generator.Generator(fp, mangle_from_=False, maxheaderlen=128)
+        gen.flatten(message)
+
+        content['message'] = fp.getvalue()
+         
         if self.debug:
             with shared.printLock:
                 sys.stdout.write(str(msg) + ": " + str(content))
